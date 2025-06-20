@@ -1,68 +1,263 @@
-import cv2  # type: ignore
-import numpy as np  # type: ignore
-import tensorflow as tf  # type: ignore
+# Import configuration first to suppress warnings
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
+import cv2
+import numpy as np
+import tensorflow as tf
 import time
+import warnings
 from collections import deque
 
-# Suppress TensorFlow warnings for cleaner output
-import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+# Suppress warnings
+warnings.filterwarnings('ignore')
+tf.get_logger().setLevel('ERROR')
 
-# Load the trained model
-model = tf.keras.models.load_model('eye_open_close_model.keras')
+class OptimizedEyeTracker:
+    def __init__(self):
+        # Core timing
+        self.start_time = time.time()
+        self.frame_count = 0
+        
+        # Enhanced blink detection
+        self.total_blinks = 0
+        self.valid_blinks = 0
+        self.blinks_per_minute = 0.0
+        self.last_blink_time = 0
+        self.blink_timestamps = deque(maxlen=50)
+        
+        # Improved eye state tracking
+        self.left_eye_states = deque(maxlen=6)
+        self.right_eye_states = deque(maxlen=6)
+        self.blink_threshold = 0.3  # Lowered for better detection
+        self.min_blink_gap = 0.15   # 150ms between blinks
+        self.consecutive_closed_frames = 0
+        self.blink_in_progress = False
+        
+        # PERCLOS calculation
+        self.eye_closure_samples = deque(maxlen=90)  # 3 seconds at 30fps
+        self.perclos_percentage = 0.0
+        
+        # Timing configuration
+        self.min_calculation_time = 8.0  # 8 seconds minimum
+        self.calculation_progress = 0.0
+        
+        # Performance tracking
+        self.fps_samples = deque(maxlen=20)
+        self.last_frame_time = time.time()
+        self.faces_detected = 0
+        self.eyes_detected = 0
+        
+        # Eye state confidence tracking
+        self.eye_confidence_history = deque(maxlen=10)
+
+    def update_performance_metrics(self):
+        """Update FPS and frame counting"""
+        current_time = time.time()
+        self.frame_count += 1
+        
+        if hasattr(self, 'last_frame_time'):
+            fps = 1.0 / max(current_time - self.last_frame_time, 0.001)
+            self.fps_samples.append(fps)
+        
+        self.last_frame_time = current_time
+        
+        # Update calculation progress
+        elapsed_time = current_time - self.start_time
+        if elapsed_time < self.min_calculation_time:
+            self.calculation_progress = (elapsed_time / self.min_calculation_time) * 100
+
+    def detect_blink_enhanced(self, left_eye_open, right_eye_open, left_confidence=0.5, right_confidence=0.5):
+        """Enhanced blink detection with confidence weighting"""
+        current_time = time.time()
+        
+        # Weight eye states by confidence
+        avg_confidence = (left_confidence + right_confidence) / 2.0
+        
+        # Only proceed if we have reasonable confidence
+        if avg_confidence < 0.3:
+            return False
+        
+        # Store eye states
+        self.left_eye_states.append(left_eye_open)
+        self.right_eye_states.append(right_eye_open)
+        self.eye_confidence_history.append(avg_confidence)
+        
+        # Calculate closure for PERCLOS
+        closure_value = 0.0
+        if not left_eye_open and not right_eye_open:
+            closure_value = 100.0
+        elif not left_eye_open or not right_eye_open:
+            closure_value = 50.0
+        
+        self.eye_closure_samples.append(closure_value)
+        
+        # Update PERCLOS
+        if len(self.eye_closure_samples) > 0:
+            self.perclos_percentage = sum(self.eye_closure_samples) / len(self.eye_closure_samples)
+        
+        # Enhanced blink detection
+        if len(self.left_eye_states) >= 4 and len(self.right_eye_states) >= 4:
+            # Get recent states
+            recent_left = list(self.left_eye_states)[-4:]
+            recent_right = list(self.right_eye_states)[-4:]
+            
+            # Look for blink pattern: open -> closed -> open
+            for i in range(1, len(recent_left) - 1):
+                # Check for simultaneous blink pattern
+                left_blink = (recent_left[i-1] and not recent_left[i] and recent_left[i+1])
+                right_blink = (recent_right[i-1] and not recent_right[i] and recent_right[i+1])
+                
+                # Alternative: check for any eye closing and opening
+                any_blink = ((recent_left[i-1] or recent_right[i-1]) and 
+                           (not recent_left[i] or not recent_right[i]) and 
+                           (recent_left[i+1] or recent_right[i+1]))
+                
+                if left_blink and right_blink:
+                    # Perfect simultaneous blink
+                    if current_time - self.last_blink_time > self.min_blink_gap:
+                        self._register_blink(current_time, "simultaneous")
+                        return True
+                elif any_blink and avg_confidence > 0.6:
+                    # Partial blink with high confidence
+                    if current_time - self.last_blink_time > self.min_blink_gap:
+                        self._register_blink(current_time, "partial")
+                        return True
+        
+        return False
+
+    def _register_blink(self, current_time, blink_type):
+        """Register a detected blink"""
+        self.total_blinks += 1
+        if blink_type == "simultaneous":
+            self.valid_blinks += 1
+        
+        self.last_blink_time = current_time
+        self.blink_timestamps.append(current_time)
+        self._update_blink_rate()
+
+    def _update_blink_rate(self):
+        """Update blink rate calculation"""
+        current_time = time.time()
+        elapsed_time = current_time - self.start_time
+        
+        if elapsed_time < self.min_calculation_time:
+            self.blinks_per_minute = 0.0
+            return
+        
+        # Use sliding window approach
+        if elapsed_time >= 60.0:
+            # Use 60-second window
+            recent_blinks = [t for t in self.blink_timestamps if current_time - t <= 60.0]
+            self.blinks_per_minute = len(recent_blinks)
+        else:
+            # Use total average
+            elapsed_minutes = elapsed_time / 60.0
+            self.blinks_per_minute = self.total_blinks / elapsed_minutes
+
+    def get_blink_status(self):
+        """Get blink rate status"""
+        current_time = time.time()
+        elapsed_time = current_time - self.start_time
+        
+        if elapsed_time < self.min_calculation_time:
+            return f"Calibrating... {self.calculation_progress:.0f}%", (255, 255, 0)
+        
+        if self.total_blinks == 0:
+            return "No Blinks Detected", (255, 100, 100)
+        elif self.blinks_per_minute < 8:
+            return "Very Low", (255, 0, 0)
+        elif self.blinks_per_minute < 12:
+            return "Low", (255, 165, 0)
+        elif self.blinks_per_minute > 25:
+            return "High", (255, 165, 0)
+        else:
+            return "Normal", (0, 255, 0)
+
+    def is_drowsy(self):
+        """Determine drowsiness state"""
+        current_time = time.time()
+        elapsed_time = current_time - self.start_time
+        
+        if elapsed_time < 15.0:
+            return False
+        
+        # Multiple drowsiness indicators
+        high_perclos = self.perclos_percentage > 70.0
+        very_low_blinks = (self.blinks_per_minute > 0 and self.blinks_per_minute < 6.0)
+        
+        return high_perclos or very_low_blinks
+
+    def get_average_fps(self):
+        """Get average FPS"""
+        return np.mean(self.fps_samples) if self.fps_samples else 0
+
+    def get_stats(self):
+        """Get comprehensive statistics"""
+        current_time = time.time()
+        runtime = current_time - self.start_time
+        recent_blinks = len([t for t in self.blink_timestamps if current_time - t <= 60])
+        
+        return {
+            'runtime': runtime,
+            'fps': self.get_average_fps(),
+            'frame_count': self.frame_count,
+            'faces_detected': self.faces_detected,
+            'eyes_detected': self.eyes_detected,
+            'total_blinks': self.total_blinks,
+            'valid_blinks': self.valid_blinks,
+            'blinks_per_minute': self.blinks_per_minute,
+            'recent_blinks': recent_blinks,
+            'perclos': self.perclos_percentage,
+            'is_drowsy': self.is_drowsy(),
+            'calculation_ready': runtime >= self.min_calculation_time,
+            'avg_confidence': np.mean(self.eye_confidence_history) if self.eye_confidence_history else 0
+        }
+
+# Load model safely
+try:
+    print("🔄 Loading eye state model...")
+    model = tf.keras.models.load_model('eye_open_close_model.keras', compile=False)
+    print("✅ Model loaded successfully!")
+except Exception as e:
+    print(f"❌ Error loading model: {e}")
+    exit(1)
+
+# Load Haar cascades
+try:
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
+    print("✅ Haar cascades loaded successfully!")
+except Exception as e:
+    print(f"❌ Error loading cascades: {e}")
+    exit(1)
 
 # Constants
 IMG_SIZE = (64, 64)
 CONFIDENCE_THRESHOLD = 0.5
-SMOOTHING_WINDOW = 5  # frames for smoothing predictions
 
-# Haar cascades for face and eye detection
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
-
-# Statistics tracking
-class EyeTracker:
-    def __init__(self):
-        self.frame_count = 0
-        self.faces_detected = 0
-        self.eyes_detected = 0
-        self.closed_eye_count = 0
-        self.open_eye_count = 0
-        self.start_time = time.time()
-        self.fps_history = deque(maxlen=30)
-        self.eye_state_history = deque(maxlen=SMOOTHING_WINDOW)
-    
-    def update_fps(self):
-        current_time = time.time()
-        if hasattr(self, 'last_time'):
-            fps = 1.0 / (current_time - self.last_time)
-            self.fps_history.append(fps)
-        self.last_time = current_time
-    
-    def get_avg_fps(self):
-        return np.mean(self.fps_history) if self.fps_history else 0
-    
-    def smooth_prediction(self, prediction):
-        """Smooth predictions to reduce flickering"""
-        self.eye_state_history.append(prediction)
-        return np.mean(self.eye_state_history)
-
-# Initialize tracker
-tracker = EyeTracker()
-
-# Color definitions
+# Enhanced color scheme
 COLORS = {
-    'open': (0, 255, 0),      # 🟢 Green
-    'closed': (0, 0, 255),    # 🔴 Red
-    'mixed': (0, 165, 255),   # 🟠 Orange
-    'no_eyes': (255, 0, 0),   # 🔵 Blue
-    'text': (255, 255, 255),  # White
-    'bg': (0, 0, 0)           # Black
+    'open': (0, 255, 0),        # Green
+    'closed': (0, 0, 255),      # Red
+    'mixed': (0, 165, 255),     # Orange
+    'text': (255, 255, 255),    # White
+    'text_secondary': (200, 200, 200),  # Light gray
+    'bg_primary': (0, 0, 0),    # Black
+    'bg_secondary': (30, 30, 30),  # Dark gray
+    'blink': (255, 255, 0),     # Yellow
+    'drowsy': (0, 0, 255),      # Red
+    'alert': (0, 255, 0),       # Green
+    'header': (100, 255, 255),  # Cyan
+    'accent': (255, 100, 100)   # Light red
 }
 
-def preprocess_eye(eye_region):
-    """Optimized eye preprocessing"""
+def preprocess_eye_safe(eye_region):
+    """Safe eye preprocessing"""
     try:
+        if eye_region.size == 0:
+            return None
         eye_resized = cv2.resize(eye_region, IMG_SIZE)
         eye_normalized = eye_resized.astype('float32') / 255.0
         eye_input = np.expand_dims(eye_normalized, axis=(0, -1))
@@ -70,656 +265,407 @@ def preprocess_eye(eye_region):
     except Exception:
         return None
 
-def predict_eye_state(eye_input, confidence_threshold=CONFIDENCE_THRESHOLD):
-    """Predict eye state with confidence"""
+def predict_eye_state_robust(eye_input):
+    """Robust eye state prediction"""
     try:
         prediction = model.predict(eye_input, verbose=0)[0][0]
-        confidence = abs(prediction - 0.5) * 2  # Convert to 0-1 confidence scale
-        is_open = prediction > confidence_threshold
+        confidence = abs(prediction - 0.5) * 2
+        is_open = prediction > CONFIDENCE_THRESHOLD
         return is_open, prediction, confidence
     except Exception:
-        return None, 0.0, 0.0
+        return True, 0.5, 0.0
 
-def draw_info_panel(frame, tracker, face_count, eye_count):
-    """Draw statistics panel"""
+def draw_enhanced_dual_panel(frame, tracker):
+    """Draw enhanced dual-panel information display"""
     height, width = frame.shape[:2]
-    panel_height = 120
+    stats = tracker.get_stats()
+    status, status_color = tracker.get_blink_status()
+    
+    # Panel dimensions
     panel_width = 300
+    panel_height = 320
+    left_panel_x = 10
+    right_panel_x = width - panel_width - 10
+    panel_y = 10
     
-    # Create semi-transparent overlay
+    # Create semi-transparent overlays
     overlay = frame.copy()
-    cv2.rectangle(overlay, (10, 10), (panel_width, panel_height), COLORS['bg'], -1)
-    cv2.addWeighted(overlay, 0.8, frame, 0.2, 0, frame)
     
-    # Statistics text
-    stats = [
-        f"FPS: {tracker.get_avg_fps():.1f}",
-        f"Faces: {face_count}",
-        f"Eyes: {eye_count}",
-        f"Total Frames: {tracker.frame_count}",
-        f"Open Eyes: {tracker.open_eye_count}",
-        f"Closed Eyes: {tracker.closed_eye_count}"
+    # Left panel background
+    cv2.rectangle(overlay, (left_panel_x, panel_y), 
+                 (left_panel_x + panel_width, panel_y + panel_height), 
+                 COLORS['bg_primary'], -1)
+    
+    # Right panel background  
+    cv2.rectangle(overlay, (right_panel_x, panel_y), 
+                 (right_panel_x + panel_width, panel_y + panel_height), 
+                 COLORS['bg_primary'], -1)
+    
+    # Apply transparency
+    cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
+    
+    # Draw panel borders
+    cv2.rectangle(frame, (left_panel_x, panel_y), 
+                 (left_panel_x + panel_width, panel_y + panel_height), 
+                 COLORS['header'], 2)
+    cv2.rectangle(frame, (right_panel_x, panel_y), 
+                 (right_panel_x + panel_width, panel_y + panel_height), 
+                 COLORS['header'], 2)
+    
+    # LEFT PANEL - System & Performance Stats
+    left_info = [
+        "🖥️ SYSTEM PERFORMANCE",
+        "",
+        f"⏱️ Runtime: {stats['runtime']:.1f}s",
+        f"🎬 FPS: {stats['fps']:.1f}",
+        f"📊 Frames: {stats['frame_count']}",
+        f"👥 Faces: {stats['faces_detected']}",
+        f"👁️ Eyes: {stats['eyes_detected']}",
+        f"🎯 Confidence: {stats['avg_confidence']:.2f}",
+        "",
+        "📋 DETECTION STATUS",
+        "",
+        f"🔍 Calculation: {'✅ Ready' if stats['calculation_ready'] else '⏳ Calibrating'}",
+        f"🤖 Model: ✅ Loaded",
+        f"📹 Camera: ✅ Active",
+        f"🎛️ Cascades: ✅ Ready",
+        "",
+        "⚙️ THRESHOLDS",
+        "",
+        f"🎯 Confidence: {CONFIDENCE_THRESHOLD}",
+        f"⏰ Min Gap: 150ms",
+        f"📊 PERCLOS: 70%",
+        f"🔄 Calibration: 8s"
     ]
     
-    for i, stat in enumerate(stats):
-        y_pos = 25 + i * 15
-        cv2.putText(frame, stat, (15, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, COLORS['text'], 1)
-
-def get_face_status(eye_states):
-    """Determine overall face status"""
-    if not eye_states:
-        return "No Eyes Detected", COLORS['no_eyes']
+    # RIGHT PANEL - Blink Analysis & Health Monitoring
+    right_info = [
+        "👁️ BLINK ANALYSIS",
+        "",
+        f"📊 Total Blinks: {stats['total_blinks']}",
+        f"✅ Valid Blinks: {stats['valid_blinks']}",
+        f"⚡ Rate: {stats['blinks_per_minute']:.1f}/min",
+        f"🎯 Status: {status}",
+        f"📈 Recent (60s): {stats['recent_blinks']}",
+        f"📋 Normal: 12-20/min",
+        "",
+        "😴 HEALTH MONITORING",
+        "",
+        f"👁️ PERCLOS: {stats['perclos']:.1f}%",
+        f"🚨 Threshold: 70%",
+        f"🔋 State: {'😴 DROWSY' if stats['is_drowsy'] else '😊 ALERT'}",
+        "",
+        "📊 ANALYSIS RANGES",
+        "",
+        f"🟢 Normal: 12-20/min",
+        f"🟡 Low: 8-12/min", 
+        f"🔴 Very Low: <8/min",
+        f"🟠 High: >25/min",
+        "",
+        "⚡ REAL-TIME FEEDBACK"
+    ]
     
-    open_count = eye_states.count(True)
-    closed_count = eye_states.count(False)
-    
-    if closed_count >= 2:
-        return "Sleepy - Both Eyes Closed", COLORS['closed']
-    elif closed_count == 1 and open_count >= 1:
-        return "Drowsy - One Eye Closed", COLORS['mixed']
-    elif open_count >= 1:
-        return "Awake - Eyes Open", COLORS['open']
-    else:
-        return "Unknown State", COLORS['no_eyes']
-
-# Start webcam with optimized settings
-cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-cap.set(cv2.CAP_PROP_FPS, 30)
-cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-print("🎥 Enhanced Real-time Eye & Head State Tracking")
-print("Features:")
-print("🟢 Green: Eyes Open | 🔴 Red: Eyes Closed | 🟠 Orange: Mixed State | 🔵 Blue: No Eyes")
-print("Press 'q' to quit, 'r' to reset statistics")
-
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
-    
-    # Update frame statistics
-    tracker.frame_count += 1
-    tracker.update_fps()
-    
-    # Convert to grayscale for detection
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    
-    # Detect faces with optimized parameters
-    faces = face_cascade.detectMultiScale(
-        gray, 
-        scaleFactor=1.2, 
-        minNeighbors=5, 
-        minSize=(50, 50),
-        flags=cv2.CASCADE_SCALE_IMAGE
-    )
-    
-    face_count = len(faces)
-    total_eyes = 0
-    
-    for (x, y, w, h) in faces:
-        tracker.faces_detected += 1
+    # Draw left panel content
+    y_offset = panel_y + 25
+    for line in left_info:
+        if line.strip() == "":
+            y_offset += 8
+            continue
         
-        # Define regions of interest
-        roi_gray = gray[y:y+h, x:x+w]
-        roi_color = frame[y:y+h, x:x+w]
+        # Color coding for left panel
+        if line.startswith("🖥️") or line.startswith("📋") or line.startswith("⚙️"):
+            color = COLORS['header']
+            font_scale = 0.45
+        elif "✅" in line:
+            color = COLORS['alert']
+            font_scale = 0.4
+        elif "⏳" in line:
+            color = COLORS['blink']
+            font_scale = 0.4
+        else:
+            color = COLORS['text']
+            font_scale = 0.4
         
-        # Detect eyes within face region
-        eyes = eye_cascade.detectMultiScale(
-            roi_gray,
-            scaleFactor=1.1,
-            minNeighbors=5,
-            minSize=(20, 20)
+        cv2.putText(frame, line, (left_panel_x + 10, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, 1)
+        y_offset += 14
+    
+    # Draw right panel content
+    y_offset = panel_y + 25
+    for line in right_info:
+        if line.strip() == "":
+            y_offset += 8
+            continue
+        
+        # Color coding for right panel
+        if line.startswith("👁️") or line.startswith("😴") or line.startswith("📊") or line.startswith("⚡"):
+            color = COLORS['header']
+            font_scale = 0.45
+        elif "Status:" in line:
+            color = status_color
+            font_scale = 0.4
+        elif "DROWSY" in line:
+            color = COLORS['drowsy']
+            font_scale = 0.4
+        elif "ALERT" in line:
+            color = COLORS['alert']
+            font_scale = 0.4
+        elif line.startswith("🟢") or line.startswith("🟡") or line.startswith("🔴") or line.startswith("🟠"):
+            color = COLORS['text_secondary']
+            font_scale = 0.35
+        else:
+            color = COLORS['text']
+            font_scale = 0.4
+        
+        cv2.putText(frame, line, (right_panel_x + 10, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, 1)
+        y_offset += 14
+    
+    # Add status indicators at the top
+    if stats['is_drowsy']:
+        cv2.putText(frame, "⚠️ DROWSINESS DETECTED", (width//2 - 100, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, COLORS['drowsy'], 2)
+    
+    # Add real-time blink indicator
+    if stats['calculation_ready']:
+        indicator_text = f"👁️ MONITORING ACTIVE | Rate: {stats['blinks_per_minute']:.1f}/min"
+        cv2.putText(frame, indicator_text, (width//2 - 150, height - 20), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLORS['alert'], 1)
+
+# Initialize tracker
+tracker = OptimizedEyeTracker()
+
+# Initialize camera
+try:
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)  # Higher resolution
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    
+    if not cap.isOpened():
+        raise Exception("Cannot open camera")
+    
+    print("✅ Camera initialized at 1280x720!")
+except Exception as e:
+    print(f"❌ Camera error: {e}")
+    exit(1)
+
+print("\n" + "="*80)
+print("🎯 ENHANCED EYE TRACKING WITH DUAL-PANEL INTERFACE")
+print("="*80)
+print("🟢 Features:")
+print("  • Real-time blink detection with confidence weighting")
+print("  • Dual-panel UI with organized information display")
+print("  • PERCLOS-based drowsiness monitoring")
+print("  • Performance metrics and system status")
+print("  • Enhanced visual feedback and alerts")
+print("="*80)
+print("🎮 Controls:")
+print("  'q' - Quit application")
+print("  'r' - Reset all statistics")
+print("  's' - Save comprehensive report")
+print("  'c' - Calibrate detection sensitivity")
+print("="*80)
+
+# Main processing loop
+blink_cooldown = 0
+try:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("❌ Failed to capture frame")
+            break
+        
+        # Update performance metrics
+        tracker.update_performance_metrics()
+        
+        # Convert to grayscale
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Detect faces
+        faces = face_cascade.detectMultiScale(
+            gray, 
+            scaleFactor=1.1, 
+            minNeighbors=5, 
+            minSize=(80, 80),
+            maxSize=(400, 400)
         )
         
-        eye_states = []
-        eye_confidences = []
+        blink_detected = False
         
-        # Process each detected eye
-        for (ex, ey, ew, eh) in eyes:
-            total_eyes += 1
-            tracker.eyes_detected += 1
+        for (x, y, w, h) in faces:
+            tracker.faces_detected += 1
             
-            # Extract and preprocess eye region
-            eye_region = roi_gray[ey:ey+eh, ex:ex+ew]
-            eye_input = preprocess_eye(eye_region)
+            # Extract face ROI
+            roi_gray = gray[y:y+h, x:x+w]
+            roi_color = frame[y:y+h, x:x+w]
             
-            if eye_input is not None:
-                # Predict eye state
-                is_open, prediction, confidence = predict_eye_state(eye_input)
-                
-                # Smooth prediction to reduce flickering
-                smoothed_prediction = tracker.smooth_prediction(prediction)
-                is_open_smoothed = smoothed_prediction > CONFIDENCE_THRESHOLD
-                
-                eye_states.append(is_open_smoothed)
-                eye_confidences.append(confidence)
-                
-                # Update statistics
-                if is_open_smoothed:
-                    tracker.open_eye_count += 1
-                else:
-                    tracker.closed_eye_count += 1
-                
-                # Draw eye bounding box
-                color = COLORS['open'] if is_open_smoothed else COLORS['closed']
-                cv2.rectangle(roi_color, (ex, ey), (ex+ew, ey+eh), color, 2)
-                
-                # Draw eye state label with confidence
-                label = f"{'Open' if is_open_smoothed else 'Closed'} ({confidence:.2f})"
-                cv2.putText(roi_color, label, (ex, ey-10), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-        
-        # Determine face status and color
-        face_status, face_color = get_face_status(eye_states)
-        
-        # Draw face bounding box
-        cv2.rectangle(frame, (x, y), (x+w, y+h), face_color, 3)
-        
-        # Draw face status label
-        cv2.putText(frame, face_status, (x, y-15), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, face_color, 2)
-        
-        # Draw eye count for this face
-        eye_info = f"Eyes: {len(eyes)}"
-        cv2.putText(frame, eye_info, (x, y+h+20), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, face_color, 1)
-    
-    # Draw information panel
-    draw_info_panel(frame, tracker, face_count, total_eyes)
-    
-    # Display frame
-    cv2.imshow('Enhanced Eye & Head Tracking', frame)
-    
-    # Handle key presses
-    key = cv2.waitKey(1) & 0xFF
-    if key == ord('q'):
-        break
-    elif key == ord('r'):
-        # Reset statistics
-        tracker = EyeTracker()
-        print("📊 Statistics reset!")
-
-# Cleanup
-cap.release()
-cv2.destroyAllWindows()
-
-# Print final statistics
-print(f"\n📊 Final Statistics:")
-print(f"Total Runtime: {time.time() - tracker.start_time:.1f} seconds")
-print(f"Total Frames: {tracker.frame_count}")
-print(f"Average FPS: {tracker.get_avg_fps():.1f}")
-print(f"Faces Detected: {tracker.faces_detected}")
-print(f"Eyes Detected: {tracker.eyes_detected}")
-print(f"Open Eyes: {tracker.open_eye_count}")
-print(f"Closed Eyes: {tracker.closed_eye_count}")
-print("👋 Thank you for using Enhanced Eye Tracking!")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-#iteration 2
-
-
-# import cv2  # type: ignore
-# import numpy as np  # type: ignore
-# import tensorflow as tf  # type: ignore
-# import time
-# from collections import deque
-# from dataclasses import dataclass
-# from typing import List, Tuple, Optional
-
-# # Suppress TensorFlow warnings for cleaner output
-# import os
-# os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-
-# # Load the trained model
-# model = tf.keras.models.load_model('eye_open_close_model.keras')
-
-# # Constants
-# IMG_SIZE = (64, 64)
-# CONFIDENCE_THRESHOLD = 0.5
-# SMOOTHING_WINDOW = 3
-# BLINK_THRESHOLD = 0.3  # Lower threshold for blink detection
-# BLINK_CONSECUTIVE_FRAMES = 2  # Minimum frames for valid blink
-# PERCLOS_WINDOW = 30  # seconds for PERCLOS calculation
-# MIN_BLINK_SEPARATION = 5  # Minimum frames between blinks
-
-# @dataclass
-# class BlinkEvent:
-#     """Represents a single blink event"""
-#     start_frame: int
-#     end_frame: int
-#     duration: float
-#     timestamp: float
-
-# @dataclass
-# class EyeState:
-#     """Represents the state of a single eye"""
-#     is_open: bool
-#     confidence: float
-#     prediction_value: float
-#     bounding_box: Tuple[int, int, int, int]
-
-# class AdvancedEyeTracker:
-#     def __init__(self):
-#         # Basic statistics
-#         self.frame_count = 0
-#         self.faces_detected = 0
-#         self.eyes_detected = 0
-#         self.start_time = time.time()
-        
-#         # Eye state tracking
-#         self.left_eye_open_count = 0
-#         self.left_eye_closed_count = 0
-#         self.right_eye_open_count = 0
-#         self.right_eye_closed_count = 0
-        
-#         # FPS tracking
-#         self.fps_history = deque(maxlen=30)
-#         self.last_time = time.time()
-        
-#         # Blink detection
-#         self.blink_history = []
-#         self.left_eye_state_history = deque(maxlen=10)
-#         self.right_eye_state_history = deque(maxlen=10)
-#         self.both_eyes_state_history = deque(maxlen=10)
-#         self.last_blink_frame = 0
-#         self.current_blink_start = None
-#         self.total_blinks = 0
-#         self.blinks_per_minute = 0
-        
-#         # PERCLOS calculation
-#         self.perclos_history = deque(maxlen=int(PERCLOS_WINDOW * 30))  # 30 FPS assumption
-#         self.perclos_value = 0.0
-#         self.drowsiness_level = "Alert"
-        
-#         # Prediction smoothing
-#         self.left_eye_predictions = deque(maxlen=SMOOTHING_WINDOW)
-#         self.right_eye_predictions = deque(maxlen=SMOOTHING_WINDOW)
-    
-#     def update_fps(self):
-#         """Update FPS calculation"""
-#         current_time = time.time()
-#         fps = 1.0 / (current_time - self.last_time)
-#         self.fps_history.append(fps)
-#         self.last_time = current_time
-    
-#     def get_avg_fps(self):
-#         """Get average FPS"""
-#         return np.mean(self.fps_history) if self.fps_history else 0
-    
-#     def smooth_prediction(self, prediction: float, eye_side: str) -> float:
-#         """Smooth predictions to reduce noise"""
-#         if eye_side == 'left':
-#             self.left_eye_predictions.append(prediction)
-#             return np.mean(self.left_eye_predictions)
-#         else:
-#             self.right_eye_predictions.append(prediction)
-#             return np.mean(self.right_eye_predictions)
-    
-#     def detect_blink(self, left_eye_open: bool, right_eye_open: bool) -> bool:
-#         """
-#         Detect simultaneous blinks (both eyes must close and open together)
-#         Returns True if a complete blink is detected
-#         """
-#         both_eyes_closed = not left_eye_open and not right_eye_open
-#         self.both_eyes_state_history.append(both_eyes_closed)
-        
-#         # Need at least 5 frames of history
-#         if len(self.both_eyes_state_history) < 5:
-#             return False
-        
-#         # Check for blink pattern: open -> closed -> open
-#         states = list(self.both_eyes_state_history)
-        
-#         # Prevent counting blinks too frequently
-#         if self.frame_count - self.last_blink_frame < MIN_BLINK_SEPARATION:
-#             return False
-        
-#         # Look for blink pattern in recent history
-#         for i in range(len(states) - 4):
-#             # Pattern: open, closed, closed, open (minimum)
-#             if (not states[i] and      # was open
-#                 states[i+1] and        # became closed
-#                 states[i+2] and        # stayed closed
-#                 not states[i+3]):      # became open again
-                
-#                 # Mark blink detected
-#                 self.last_blink_frame = self.frame_count
-#                 self.total_blinks += 1
-                
-#                 # Calculate blinks per minute
-#                 elapsed_minutes = (time.time() - self.start_time) / 60
-#                 if elapsed_minutes > 0:
-#                     self.blinks_per_minute = self.total_blinks / elapsed_minutes
-                
-#                 return True
-        
-#         return False
-    
-#     def update_perclos(self, both_eyes_closed: bool):
-#         """Update PERCLOS (Percentage of Eyelid Closure) calculation"""
-#         self.perclos_history.append(both_eyes_closed)
-        
-#         if len(self.perclos_history) >= 30:  # At least 1 second of data
-#             closed_frames = sum(self.perclos_history)
-#             total_frames = len(self.perclos_history)
-#             self.perclos_value = (closed_frames / total_frames) * 100
+            # Detect eyes
+            eyes = eye_cascade.detectMultiScale(
+                roi_gray,
+                scaleFactor=1.1,
+                minNeighbors=5,
+                minSize=(30, 30),
+                maxSize=(80, 80)
+            )
             
-#             # Determine drowsiness level based on PERCLOS
-#             if self.perclos_value >= 80:
-#                 self.drowsiness_level = "Severely Drowsy"
-#             elif self.perclos_value >= 50:
-#                 self.drowsiness_level = "Moderately Drowsy"
-#             elif self.perclos_value >= 20:
-#                 self.drowsiness_level = "Mildly Drowsy"
-#             else:
-#                 self.drowsiness_level = "Alert"
-    
-#     def get_drowsiness_color(self):
-#         """Get color based on drowsiness level"""
-#         colors = {
-#             "Alert": (0, 255, 0),           # Green
-#             "Mildly Drowsy": (0, 255, 255), # Yellow
-#             "Moderately Drowsy": (0, 165, 255), # Orange
-#             "Severely Drowsy": (0, 0, 255)  # Red
-#         }
-#         return colors.get(self.drowsiness_level, (255, 255, 255))
-
-# # Initialize tracker
-# tracker = AdvancedEyeTracker()
-
-# # Haar cascades for face and eye detection
-# face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-# eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
-
-# # Color definitions
-# COLORS = {
-#     'open': (0, 255, 0),      # Green
-#     'closed': (0, 0, 255),    # Red
-#     'mixed': (0, 165, 255),   # Orange
-#     'no_eyes': (255, 0, 0),   # Blue
-#     'text': (255, 255, 255),  # White
-#     'bg': (0, 0, 0),          # Black
-#     'blink': (255, 0, 255)    # Magenta for blink indication
-# }
-
-# def preprocess_eye(eye_region):
-#     """Optimized eye preprocessing"""
-#     try:
-#         eye_resized = cv2.resize(eye_region, IMG_SIZE)
-#         eye_normalized = eye_resized.astype('float32') / 255.0
-#         eye_input = np.expand_dims(eye_normalized, axis=(0, -1))
-#         return eye_input
-#     except Exception:
-#         return None
-
-# def predict_eye_state(eye_input, confidence_threshold=CONFIDENCE_THRESHOLD):
-#     """Predict eye state with confidence"""
-#     try:
-#         prediction = model.predict(eye_input, verbose=0)[0][0]
-#         confidence = abs(prediction - 0.5) * 2
-#         is_open = prediction > confidence_threshold
-#         return is_open, prediction, confidence
-#     except Exception:
-#         return None, 0.0, 0.0
-
-# def classify_eyes(eyes, roi_gray):
-#     """Classify eyes as left/right based on position"""
-#     if len(eyes) != 2:
-#         return None, None
-    
-#     # Sort eyes by x-coordinate (left eye has smaller x)
-#     eyes_sorted = sorted(eyes, key=lambda eye: eye[0])
-#     left_eye = eyes_sorted[0]
-#     right_eye = eyes_sorted[1]
-    
-#     return left_eye, right_eye
-
-# def draw_advanced_info_panel(frame, tracker):
-#     """Draw comprehensive statistics panel"""
-#     height, width = frame.shape[:2]
-#     panel_height = 200
-#     panel_width = 350
-    
-#     # Create semi-transparent overlay
-#     overlay = frame.copy()
-#     cv2.rectangle(overlay, (10, 10), (panel_width, panel_height), COLORS['bg'], -1)
-#     cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
-    
-#     # Statistics text
-#     stats = [
-#         f"FPS: {tracker.get_avg_fps():.1f}",
-#         f"Frame: {tracker.frame_count}",
-#         f"Runtime: {time.time() - tracker.start_time:.1f}s",
-#         "",
-#         f"👁️ Eye Statistics:",
-#         f"Left Eye - Open: {tracker.left_eye_open_count}",
-#         f"Left Eye - Closed: {tracker.left_eye_closed_count}",
-#         f"Right Eye - Open: {tracker.right_eye_open_count}",
-#         f"Right Eye - Closed: {tracker.right_eye_closed_count}",
-#         "",
-#         f"👀 Blink Analysis:",
-#         f"Total Blinks: {tracker.total_blinks}",
-#         f"Blinks/Min: {tracker.blinks_per_minute:.1f}",
-#         "",
-#         f"😴 PERCLOS Analysis:",
-#         f"PERCLOS: {tracker.perclos_value:.1f}%",
-#         f"Status: {tracker.drowsiness_level}"
-#     ]
-    
-#     for i, stat in enumerate(stats):
-#         if stat:  # Skip empty strings
-#             y_pos = 25 + i * 12
-#             color = tracker.get_drowsiness_color() if "Status:" in stat else COLORS['text']
-#             cv2.putText(frame, stat, (15, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
-
-# def draw_blink_indicator(frame, blink_detected):
-#     """Draw blink indicator"""
-#     if blink_detected:
-#         height, width = frame.shape[:2]
-#         cv2.putText(frame, "BLINK DETECTED!", (width - 200, 30), 
-#                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, COLORS['blink'], 2)
-#         cv2.circle(frame, (width - 30, 30), 15, COLORS['blink'], -1)
-
-# # Start webcam with optimized settings
-# cap = cv2.VideoCapture(0)
-# cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-# cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-# cap.set(cv2.CAP_PROP_FPS, 30)
-# cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-# print("👁️ Advanced Eye Tracking System with Blink Detection & PERCLOS")
-# print("Features:")
-# print("🟢 Green: Eyes Open | 🔴 Red: Eyes Closed")
-# print("👀 Simultaneous Blink Detection")
-# print("😴 PERCLOS Drowsiness Analysis")
-# print("📊 Individual Eye Statistics")
-# print("Press 'q' to quit, 'r' to reset statistics")
-
-# blink_detected = False
-# blink_timer = 0
-
-# while True:
-#     ret, frame = cap.read()
-#     if not ret:
-#         break
-    
-#     # Update frame statistics
-#     tracker.frame_count += 1
-#     tracker.update_fps()
-    
-#     # Reset blink indicator
-#     if blink_timer > 0:
-#         blink_timer -= 1
-#         if blink_timer == 0:
-#             blink_detected = False
-    
-#     # Convert to grayscale for detection
-#     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    
-#     # Detect faces
-#     faces = face_cascade.detectMultiScale(
-#         gray, 
-#         scaleFactor=1.2, 
-#         minNeighbors=5, 
-#         minSize=(50, 50),
-#         flags=cv2.CASCADE_SCALE_IMAGE
-#     )
-    
-#     for (x, y, w, h) in faces:
-#         tracker.faces_detected += 1
-        
-#         # Define regions of interest
-#         roi_gray = gray[y:y+h, x:x+w]
-#         roi_color = frame[y:y+h, x:x+w]
-        
-#         # Detect eyes within face region
-#         eyes = eye_cascade.detectMultiScale(
-#             roi_gray,
-#             scaleFactor=1.1,
-#             minNeighbors=3,
-#             minSize=(20, 20)
-#         )
-        
-#         # Process exactly 2 eyes for proper blink detection
-#         if len(eyes) == 2:
-#             left_eye, right_eye = classify_eyes(eyes, roi_gray)
+            eye_states = []
+            eye_confidences = []
             
-#             # Process left eye
-#             ex, ey, ew, eh = left_eye
-#             eye_region = roi_gray[ey:ey+eh, ex:ex+ew]
-#             eye_input = preprocess_eye(eye_region)
-            
-#             left_eye_open = True
-#             left_confidence = 0.0
-            
-#             if eye_input is not None:
-#                 is_open, prediction, confidence = predict_eye_state(eye_input, BLINK_THRESHOLD)
-#                 smoothed_prediction = tracker.smooth_prediction(prediction, 'left')
-#                 left_eye_open = smoothed_prediction > BLINK_THRESHOLD
-#                 left_confidence = confidence
+            # Process each eye
+            for (ex, ey, ew, eh) in eyes:
+                tracker.eyes_detected += 1
                 
-#                 # Update statistics
-#                 if left_eye_open:
-#                     tracker.left_eye_open_count += 1
-#                 else:
-#                     tracker.left_eye_closed_count += 1
+                # Extract and process eye region
+                eye_region = roi_gray[ey:ey+eh, ex:ex+ew]
+                eye_input = preprocess_eye_safe(eye_region)
                 
-#                 # Draw left eye
-#                 color = COLORS['open'] if left_eye_open else COLORS['closed']
-#                 cv2.rectangle(roi_color, (ex, ey), (ex+ew, ey+eh), color, 2)
-#                 cv2.putText(roi_color, f"L: {'Open' if left_eye_open else 'Closed'}", 
-#                            (ex, ey-10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+                if eye_input is not None:
+                    # Predict eye state
+                    is_open, prediction, confidence = predict_eye_state_robust(eye_input)
+                    
+                    eye_states.append(is_open)
+                    eye_confidences.append(confidence)
+                    
+                    # Draw eye rectangle with confidence-based color
+                    if confidence > 0.7:
+                        color = COLORS['open'] if is_open else COLORS['closed']
+                    else:
+                        color = COLORS['mixed']
+                    
+                    cv2.rectangle(roi_color, (ex, ey), (ex+ew, ey+eh), color, 2)
+                    
+                    # Draw confidence score
+                    cv2.putText(roi_color, f"{confidence:.2f}", (ex, ey-5), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
             
-#             # Process right eye
-#             ex, ey, ew, eh = right_eye
-#             eye_region = roi_gray[ey:ey+eh, ex:ex+ew]
-#             eye_input = preprocess_eye(eye_region)
-            
-#             right_eye_open = True
-#             right_confidence = 0.0
-            
-#             if eye_input is not None:
-#                 is_open, prediction, confidence = predict_eye_state(eye_input, BLINK_THRESHOLD)
-#                 smoothed_prediction = tracker.smooth_prediction(prediction, 'right')
-#                 right_eye_open = smoothed_prediction > BLINK_THRESHOLD
-#                 right_confidence = confidence
+            # Blink detection
+            if len(eyes) >= 2 and len(eye_states) >= 2:
+                left_eye_open = eye_states[0]
+                right_eye_open = eye_states[1]
+                left_conf = eye_confidences[0] if len(eye_confidences) > 0 else 0.5
+                right_conf = eye_confidences[1] if len(eye_confidences) > 1 else 0.5
                 
-#                 # Update statistics
-#                 if right_eye_open:
-#                     tracker.right_eye_open_count += 1
-#                 else:
-#                     tracker.right_eye_closed_count += 1
-                
-#                 # Draw right eye
-#                 color = COLORS['open'] if right_eye_open else COLORS['closed']
-#                 cv2.rectangle(roi_color, (ex, ey), (ex+ew, ey+eh), color, 2)
-#                 cv2.putText(roi_color, f"R: {'Open' if right_eye_open else 'Closed'}", 
-#                            (ex, ey-10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+                # Enhanced blink detection
+                if tracker.detect_blink_enhanced(left_eye_open, right_eye_open, left_conf, right_conf):
+                    blink_detected = True
+                    blink_cooldown = 10  # Visual feedback duration
+                    
+                    # Blink animation
+                    cv2.circle(frame, (x + w//2, y + h//2), 40, COLORS['blink'], 4)
+                    cv2.putText(frame, "BLINK DETECTED!", (x - 30, y - 30), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, COLORS['blink'], 2)
             
-#             # Detect blinks (both eyes must close simultaneously)
-#             if tracker.detect_blink(left_eye_open, right_eye_open):
-#                 blink_detected = True
-#                 blink_timer = 15  # Show blink indicator for 15 frames
+            # Blink cooldown animation
+            if blink_cooldown > 0:
+                blink_cooldown -= 1
+                cv2.circle(frame, (x + w//2, y + h//2), 25, COLORS['blink'], 2)
             
-#             # Update PERCLOS
-#             both_eyes_closed = not left_eye_open and not right_eye_open
-#             tracker.update_perclos(both_eyes_closed)
+            # Draw face rectangle
+            face_color = COLORS['drowsy'] if tracker.is_drowsy() else COLORS['alert']
+            cv2.rectangle(frame, (x, y), (x+w, y+h), face_color, 3)
             
-#             # Determine face status
-#             if both_eyes_closed:
-#                 face_status = "Both Eyes Closed"
-#                 face_color = COLORS['closed']
-#             elif not left_eye_open or not right_eye_open:
-#                 face_status = "One Eye Closed"
-#                 face_color = COLORS['mixed']
-#             else:
-#                 face_status = f"Alert - {tracker.drowsiness_level}"
-#                 face_color = tracker.get_drowsiness_color()
+            # Face status
+            status = "😴 DROWSY" if tracker.is_drowsy() else "😊 ALERT"
+            cv2.putText(frame, status, (x, y-8), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, face_color, 2)
         
-#         else:
-#             # Handle cases with != 2 eyes
-#             face_status = f"Eyes Detected: {len(eyes)}"
-#             face_color = COLORS['no_eyes']
+        # Draw enhanced dual-panel display
+        draw_enhanced_dual_panel(frame, tracker)
         
-#         # Draw face bounding box
-#         cv2.rectangle(frame, (x, y), (x+w, y+h), face_color, 3)
-#         cv2.putText(frame, face_status, (x, y-15), 
-#                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, face_color, 2)
-    
-#     # Draw information panels
-#     draw_advanced_info_panel(frame, tracker)
-#     draw_blink_indicator(frame, blink_detected)
-    
-#     # Display frame
-#     cv2.imshow('Advanced Eye Tracking with Blink Detection & PERCLOS', frame)
-    
-#     # Handle key presses
-#     key = cv2.waitKey(1) & 0xFF
-#     if key == ord('q'):
-#         break
-#     elif key == ord('r'):
-#         # Reset statistics
-#         tracker = AdvancedEyeTracker()
-#         print("📊 All statistics reset!")
+        # Show frame
+        cv2.imshow('Enhanced Eye Tracking - Dual Panel Interface', frame)
+        
+        # Handle key presses
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('r'):
+            tracker = OptimizedEyeTracker()
+            print("📊 All statistics reset!")
+        elif key == ord('s'):
+            # Save comprehensive report
+            stats = tracker.get_stats()
+            timestamp = int(time.time())
+            
+            report = f"""
+ENHANCED EYE TRACKING COMPREHENSIVE REPORT
+=========================================
+Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}
+Session Duration: {stats['runtime']:.1f} seconds ({stats['runtime']/60:.1f} minutes)
 
-# # Cleanup
-# cap.release()
-# cv2.destroyAllWindows()
+PERFORMANCE METRICS:
+- Average FPS: {stats['fps']:.1f}
+- Total Frames Processed: {stats['frame_count']}
+- Detection Efficiency: {(stats['eyes_detected']/max(stats['frame_count'], 1)*100):.1f}%
+- Average Confidence: {stats['avg_confidence']:.2f}
 
-# # Print final comprehensive report
-# print(f"\n📊 COMPREHENSIVE FINAL REPORT")
-# print(f"{'='*50}")
-# print(f"⏱️  Runtime: {time.time() - tracker.start_time:.1f} seconds")
-# print(f"🎬 Total Frames: {tracker.frame_count}")
-# print(f"📈 Average FPS: {tracker.get_avg_fps():.1f}")
-# print(f"\n👁️  EYE STATISTICS:")
-# print(f"   Left Eye  - Open: {tracker.left_eye_open_count:4d} | Closed: {tracker.left_eye_closed_count:4d}")
-# print(f"   Right Eye - Open: {tracker.right_eye_open_count:4d} | Closed: {tracker.right_eye_closed_count:4d}")
-# print(f"\n👀 BLINK ANALYSIS:")
-# print(f"   Total Blinks: {tracker.total_blinks}")
-# print(f"   Blinks per Minute: {tracker.blinks_per_minute:.1f}")
-# print(f"   Normal Range: 12-20 blinks/min")
-# print(f"\n😴 PERCLOS DROWSINESS ANALYSIS:")
-# print(f"   Final PERCLOS: {tracker.perclos_value:.1f}%")
-# print(f"   Drowsiness Level: {tracker.drowsiness_level}")
-# print(f"   PERCLOS Scale: <20% Alert | 20-50% Mild | 50-80% Moderate | >80% Severe")
-# print(f"\n👋 Session Complete - Thank you for using Advanced Eye Tracking!")
+FACE & EYE DETECTION:
+- Faces Detected: {stats['faces_detected']}
+- Eyes Detected: {stats['eyes_detected']}
+- Detection Rate: {(stats['faces_detected']/max(stats['frame_count'], 1)*100):.1f}%
+
+BLINK ANALYSIS:
+- Total Blinks: {stats['total_blinks']}
+- Valid Blinks: {stats['valid_blinks']}
+- Blinks per Minute: {stats['blinks_per_minute']:.1f}
+- Recent Activity (60s): {stats['recent_blinks']} blinks
+- Detection Accuracy: {(stats['valid_blinks']/max(stats['total_blinks'], 1)*100):.1f}%
+
+HEALTH ASSESSMENT:
+- PERCLOS: {stats['perclos']:.1f}%
+- Drowsiness Threshold: 70%
+- Current State: {'DROWSY' if stats['is_drowsy'] else 'ALERT'}
+- Monitoring Status: {'Active' if stats['calculation_ready'] else 'Calibrating'}
+
+CLINICAL INTERPRETATION:
+- Normal Blink Rate: 12-20 per minute
+- Current Classification: {tracker.get_blink_status()[0]}
+- Drowsiness Risk: {'HIGH' if stats['is_drowsy'] else 'LOW'}
+- Recommendation: {'Immediate attention needed' if stats['is_drowsy'] else 'Continue monitoring'}
+
+TECHNICAL DETAILS:
+- Model: eye_open_close_model.keras
+- Confidence Threshold: {CONFIDENCE_THRESHOLD}
+- Minimum Blink Gap: 150ms
+- PERCLOS Window: 3 seconds
+- Calibration Time: 8 seconds
+"""
+            
+            filename = f"comprehensive_eye_tracking_report_{timestamp}.txt"
+            with open(filename, "w") as f:
+                f.write(report)
+            print(f"📄 Comprehensive report saved: {filename}")
+        
+        elif key == ord('c'):
+            # Calibration mode
+            print("🔧 Calibration mode - Adjusting sensitivity...")
+            tracker.blink_threshold *= 0.9  # Make more sensitive
+            print(f"📊 New threshold: {tracker.blink_threshold:.2f}")
+
+except KeyboardInterrupt:
+    print("\n⏹️ Application stopped by user")
+except Exception as e:
+    print(f"❌ Unexpected error: {e}")
+finally:
+    # Cleanup
+    cap.release()
+    cv2.destroyAllWindows()
+    
+    # Final comprehensive statistics
+    final_stats = tracker.get_stats()
+    print(f"\n" + "="*60)
+    print("📊 FINAL SESSION SUMMARY")
+    print("="*60)
+    print(f"⏱️ Session Duration: {final_stats['runtime']:.1f} seconds")
+    print(f"🎬 Average FPS: {final_stats['fps']:.1f}")
+    print(f"👁️ Total Blinks Detected: {final_stats['total_blinks']}")
+    print(f"✅ Valid Blinks: {final_stats['valid_blinks']}")
+    print(f"📊 Final Blink Rate: {final_stats['blinks_per_minute']:.1f}/minute")
+    print(f"🎯 Average Confidence: {final_stats['avg_confidence']:.2f}")
+    print(f"📈 PERCLOS: {final_stats['perclos']:.1f}%")
+    print(f"🔋 Final State: {'😴 DROWSY' if final_stats['is_drowsy'] else '😊 ALERT'}")
+    print("="*60)
+    print("👋 Thank you for using Enhanced Eye Tracking!")
+    print("💡 For best results, ensure good lighting and face the camera directly.")
